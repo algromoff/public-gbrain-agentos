@@ -174,9 +174,38 @@ def _require_slots_write(agent_ctx: AgentContext) -> None:
         )
 
 
+# Cyrillic -> Latin, applied before slugifying. Without it a title written
+# entirely in Russian collapses to an empty slug and every such note of the
+# same day overwrites the previous one at `<scope>/<date>-.md` (real data loss
+# on 2026-07-29 and 2026-08-04).
+_TRANSLIT = {
+    "\u0430": "a", "\u0431": "b", "\u0432": "v", "\u0433": "g", "\u0434": "d",
+    "\u0435": "e", "\u0451": "e", "\u0436": "zh", "\u0437": "z", "\u0438": "i",
+    "\u0439": "y", "\u043a": "k", "\u043b": "l", "\u043c": "m", "\u043d": "n",
+    "\u043e": "o", "\u043f": "p", "\u0440": "r", "\u0441": "s", "\u0442": "t",
+    "\u0443": "u", "\u0444": "f", "\u0445": "h", "\u0446": "ts", "\u0447": "ch",
+    "\u0448": "sh", "\u0449": "sch", "\u044a": "", "\u044b": "y", "\u044c": "",
+    "\u044d": "e", "\u044e": "yu", "\u044f": "ya",
+    # Ukrainian / Belarusian letters that show up in pasted titles.
+    "\u0454": "ye", "\u0456": "i", "\u0457": "yi", "\u0491": "g", "\u045e": "u",
+}
+
+
+def _transliterate(text: str) -> str:
+    """Replace Cyrillic letters with Latin ones, leave everything else alone."""
+    return "".join(_TRANSLIT.get(ch, ch) for ch in text)
+
+
 def _slugify(title: str) -> str:
-    """Generate a URL-safe slug from a title."""
-    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:MAX_SLUG_LENGTH]
+    """Generate a URL-safe, never-empty slug from a title."""
+    slug = re.sub(r"[^a-z0-9]+", "-", _transliterate(title.lower())).strip("-")
+    slug = slug[:MAX_SLUG_LENGTH].strip("-")
+    if slug:
+        return slug
+    # Nothing survived — a title in a script we do not transliterate (CJK) or
+    # made of punctuation only. A digest keeps the path non-empty and keeps two
+    # different such titles on different paths, which is the whole point.
+    return "note-" + hashlib.sha1(title.encode("utf-8")).hexdigest()[:8]
 
 
 def _today_iso() -> str:
@@ -307,6 +336,30 @@ async def _upsert_document(
         scope,
     )
     return int(doc_id), True
+
+
+async def _find_duplicate_by_hash(
+    pool: asyncpg.Pool,
+    content_hash: str,
+    exclude_path: str | None = None,
+) -> dict[str, object] | None:
+    """Look up an existing document with the same sha256 anywhere in the vault.
+
+    Unlike the path-scoped check in :func:`_upsert_document` (an idempotent
+    re-write guard for the SAME path), this scans across all paths -- it
+    catches an exact copy-pasted duplicate saved under a different note type
+    or filename. It cannot catch paraphrased/semantic duplicates (different
+    hash for different wording); that requires an embedding-similarity check
+    via recall_mcp instead.
+    """
+    row = await pool.fetchrow(
+        "SELECT id, path, source_type FROM documents WHERE sha256 = $1 AND path != $2 LIMIT 1",
+        content_hash,
+        exclude_path or "",
+    )
+    if row is None:
+        return None
+    return {"id": int(row["id"]), "path": row["path"], "source_type": row["source_type"]}
 
 
 def _json_dumps(obj: object) -> str:
@@ -441,6 +494,41 @@ def register_tools(
                 return server.tool(**kwargs)(fn)
             return fn
         return decorator
+
+    # ------------------------------------------------------------------
+    # 0. check_duplicate_hash
+    # ------------------------------------------------------------------
+    @gated_tool(
+        "check_duplicate_hash",
+        annotations={"readOnlyHint": True},
+    )
+    async def check_duplicate_hash(
+        content: str,
+        ctx: dict[str, object] | None = None,
+    ) -> str:
+        """Check whether byte-identical content already exists anywhere in the vault.
+
+        Call with the fully-rendered note body BEFORE create_*_note to catch
+        an exact copy-paste duplicate saved under a different path/note type
+        (the path-scoped check inside create_*_note only guards re-writes to
+        the SAME path). Does not catch paraphrased/semantic duplicates --
+        use gbrain-recall's `related` for that.
+        """
+        t0 = time.monotonic()
+        pool: asyncpg.Pool = await get_pool_fn()  # type: ignore[misc]
+        agent_ctx = await _authenticate_request(ctx, pool)
+
+        content_hash = _sha256(content)
+        dup = await _find_duplicate_by_hash(pool, content_hash)
+
+        await log_audit(
+            pool, agent_ctx.agent, "check_duplicate_hash",
+            {"found": dup is not None},
+            "ok", int((time.monotonic() - t0) * 1000),
+        )
+        if dup is None:
+            return _json_dumps({"duplicate": False})
+        return _json_dumps({"duplicate": True, **dup})
 
     # ------------------------------------------------------------------
     # 1. create_decision_note

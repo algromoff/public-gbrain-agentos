@@ -1,14 +1,23 @@
-"""FastEmbed wrapper with LRU cache."""
-import hashlib
-import logging
-from collections import OrderedDict
+"""FastEmbed wrapper with LRU cache.
 
-from fastembed import TextEmbedding
+The model lives in a child process (embed_child.py) that is started on the
+first embed() and stopped after IDLE_UNLOAD_SEC without work - task 868: the
+queue gets 1-2 documents a day, the model takes ~2 GB of RAM and swap.
+"""
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 32
 CACHE_MAX_SIZE = 512
+IDLE_UNLOAD_SEC = int(os.environ.get("GBRAIN_EMBED_IDLE_UNLOAD_SEC", "600"))
 
 
 def _cache_key(text: str) -> str:
@@ -19,22 +28,76 @@ def _cache_key(text: str) -> str:
 class Embedder:
     """Batch text embedder backed by FastEmbed with in-memory cache.
 
-    Model is loaded lazily on first call to embed() or embed_single().
+    Model is loaded lazily in a child process on the first call to embed()
+    or embed_single() and unloaded by release_if_idle().
     Cache uses OrderedDict as LRU with maxsize check.
     """
 
     def __init__(self, model_name: str = "intfloat/multilingual-e5-large") -> None:
         self._model_name = model_name
-        self._model: TextEmbedding | None = None
+        self._child: subprocess.Popen | None = None
+        self._last_used = 0.0
         self._cache: OrderedDict[str, list[float]] = OrderedDict()
 
-    def _ensure_model(self) -> TextEmbedding:
-        """Load model on first use."""
-        if self._model is None:
-            logger.info("Loading FastEmbed model: %s", self._model_name)
-            self._model = TextEmbedding(model_name=self._model_name)
-            logger.info("FastEmbed model loaded")
-        return self._model
+    def _ensure_child(self) -> subprocess.Popen:
+        """Start the model process on first use."""
+        if self._child is not None and self._child.poll() is None:
+            return self._child
+        self._child = None
+        logger.info("Loading FastEmbed model: %s", self._model_name)
+        started = time.monotonic()
+        child = subprocess.Popen(
+            [sys.executable, "-m", "services.ingest_worker.embed_child", self._model_name],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        line = child.stdout.readline()
+        if not line or json.loads(line).get("ready") is not True:
+            child.kill()
+            child.wait()
+            raise RuntimeError(f"embed child failed to start: {line!r}")
+        logger.info("FastEmbed model loaded in %.1f s (pid %d)",
+                    time.monotonic() - started, child.pid)
+        self._child = child
+        return child
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        child = self._ensure_child()
+        try:
+            child.stdin.write(json.dumps(texts) + "\n")
+            child.stdin.flush()
+            line = child.stdout.readline()
+        except (BrokenPipeError, OSError):
+            self.close()
+            raise
+        if not line:
+            self.close()
+            raise RuntimeError("embed child exited")
+        reply = json.loads(line)
+        if isinstance(reply, dict):
+            raise RuntimeError(f"embed child error: {reply.get('error')}")
+        if len(reply) != len(texts):
+            raise RuntimeError(f"embed child returned {len(reply)} vectors for {len(texts)} texts")
+        return reply
+
+    def release_if_idle(self) -> bool:
+        """Stop the model process after IDLE_UNLOAD_SEC without work."""
+        if self._child is None or time.monotonic() - self._last_used < IDLE_UNLOAD_SEC:
+            return False
+        self.close()
+        logger.info("FastEmbed model unloaded after %d s idle", IDLE_UNLOAD_SEC)
+        return True
+
+    def close(self) -> None:
+        """Stop the model process if it runs."""
+        child, self._child = self._child, None
+        if child is None:
+            return
+        try:
+            child.stdin.close()
+            child.wait(timeout=10)
+        except Exception:
+            child.kill()
+            child.wait()
 
     def _cache_get(self, text: str) -> list[float] | None:
         """Get cached embedding, updating LRU order."""
@@ -61,8 +124,6 @@ class Embedder:
         Returns:
             List of embedding vectors in same order as input.
         """
-        model = self._ensure_model()
-
         results: list[list[float] | None] = [None] * len(texts)
         uncached_indices: list[int] = []
         uncached_texts: list[str] = []
@@ -79,9 +140,8 @@ class Embedder:
             all_embeddings: list[list[float]] = []
             for batch_start in range(0, len(uncached_texts), BATCH_SIZE):
                 batch = uncached_texts[batch_start:batch_start + BATCH_SIZE]
-                batch_results = list(model.embed(batch))
-                for vec in batch_results:
-                    all_embeddings.append(vec.tolist())
+                all_embeddings.extend(self._embed_batch(batch))
+                self._last_used = time.monotonic()
 
             for i, (idx, emb) in enumerate(
                 zip(uncached_indices, all_embeddings)

@@ -36,6 +36,19 @@ VALID_PRIORITIES: frozenset[str] = frozenset({
     "low", "medium", "high", "critical",
 })
 
+# Wishlist tasks are numbered from 8000 so the operator can tell them apart
+# from operational tasks by the number alone. Operational tasks keep the
+# original bigserial sequence.
+OPERATIONAL_ID_SEQUENCE = "tasks_id_seq"
+WISHLIST_ID_SEQUENCE = "tasks_wishlist_id_seq"
+
+
+def _id_sequence_for(metadata: dict[str, Any] | None) -> str:
+    """Pick the id sequence a new task draws from, by metadata.type."""
+    if metadata and metadata.get("type") == "wishlist":
+        return WISHLIST_ID_SEQUENCE
+    return OPERATIONAL_ID_SEQUENCE
+
 
 def _json_dumps(data: dict[str, Any]) -> str:
     """Serialize dict to JSON string for JSONB columns."""
@@ -101,7 +114,9 @@ async def create_task(
         description: Task description.
         assignee: Agent assigned to the task.
         priority: One of low, medium, high, critical.
-        metadata: Arbitrary JSONB metadata.
+        metadata: Arbitrary JSONB metadata. metadata["type"] == "wishlist"
+            draws the id from the wishlist sequence (8000+) instead of the
+            operational one.
 
     Returns:
         Created task as a dict with all fields.
@@ -118,15 +133,18 @@ async def create_task(
         )
 
     meta_json = _json_dumps(metadata or {})
+    # The sequence name comes from the fixed pair above, never from the caller.
+    sequence = _id_sequence_for(metadata)
     row = await pool.fetchrow(
         """
         INSERT INTO tasks
-          (title, description, status, assignee, priority, created_by, metadata)
-        VALUES ($1, $2, 'new', $3, $4, $5, $6::jsonb)
+          (id, title, description, status, assignee, priority, created_by, metadata)
+        VALUES (nextval($1::regclass), $2, $3, 'new', $4, $5, $6, $7::jsonb)
         RETURNING id, title, description, status, assignee, priority,
                   created_by, created_at, updated_at,
                   metadata::text AS metadata_json
         """,
+        sequence,
         title.strip(),
         description,
         assignee,

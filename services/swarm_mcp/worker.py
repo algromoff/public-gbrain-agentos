@@ -1,7 +1,8 @@
 """swarm-mcp worker — polls delivery_outbox and POSTs to agent gateways.
 
 Transport: HTTP POST to URL from AGENT_GATEWAYS env (JSON map {agent: url}).
-HTTP 200/2xx → mark_acked. 5xx/timeout/network → mark_retry with backoff.
+HTTP 200/2xx → mark_sent (delivered; the ack is the receiving agent's own call).
+5xx/timeout/network → mark_retry with backoff.
 4xx (except 429) → mark as failed (permanent client error).
 Missing gateway URL for an agent → mark_retry (operator can configure later).
 
@@ -55,6 +56,11 @@ BATCH_SIZE = 20
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 GATEWAY_TOKEN = os.environ.get("GATEWAY_WEBHOOK_TOKEN", "")
 COORDINATOR_AGENT = os.environ.get("COORDINATOR_AGENT", "coordinator-agent")
+# Senders with no inbound bus (Richard, task 871): a notify back to them never
+# delivers and piles up as failed, so the prompt must not ask for one.
+NO_INBOX_AGENTS = frozenset(
+    a.strip() for a in os.environ.get("GBRAIN_NO_INBOX_AGENTS", "richard").split(",") if a.strip()
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,10 +177,22 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
     chat gateway (synthetic update). Agent must call swarm.ack(task_id) when done.
 
     Loop-prevention gates:
-    - Ack-only fast path for: (a) reports back to the coordinator (COORDINATOR_AGENT),
-      detected by title prefix "Report from " or `_origin_task` field; (b) explicit
-      smoke pings via `_smoke=true`. These skip the full report + dual-notify flow
-      which would otherwise cause infinite recursion (coordinator → coordinator).
+    - Ack-only fast path for: (a) any retro-report, detected by title prefix
+      "Report from " or the `_origin_task` field, whoever it is addressed to;
+      (b) requests to the coordinator (COORDINATOR_AGENT); (c) explicit smoke
+      pings via `_smoke=true`. These skip the full report + dual-notify flow
+      which would otherwise cause infinite recursion.
+
+    Reports go to whoever set the task (operator decision 2026-08-12): step 3
+    below notifies `from_agent`, not the coordinator. Before that, every
+    delivery from any agent also produced a report to the coordinator, so a
+    task set by the marketer woke the coordinator's session for nothing — the
+    coordinator had not asked for it and could only ack. Its own tasks still
+    report back to it, because then it IS `from_agent`.
+
+    The retro-report gate had to widen with that change: once reports go to
+    `from_agent`, a report to a non-coordinator agent would otherwise arrive as
+    a full task and be reported back — an endless ping-pong between two agents.
     """
     title = payload.get("title") or "(no title)"
     body = payload.get("body") or ""
@@ -189,14 +207,13 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
     # Plus explicit smoke pings (`_smoke=true`) for any target.
     is_to_coordinator = to_agent == COORDINATOR_AGENT
     is_smoke = bool(payload.get("_smoke"))
+    is_retro = bool(str(title).startswith("Report from") or payload.get("_origin_task"))
 
-    if is_to_coordinator or is_smoke:
-        if is_to_coordinator:
-            kind_hint = (
-                "retro-summary"
-                if str(title).startswith("Report from") or payload.get("_origin_task")
-                else "request to coordinator"
-            )
+    if is_to_coordinator or is_smoke or is_retro:
+        if is_retro:
+            kind_hint = "retro-summary"
+        elif is_to_coordinator:
+            kind_hint = "request to coordinator"
         else:
             kind_hint = "smoke ping"
         return (
@@ -211,6 +228,24 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
             f"Otherwise skip.\n"
             f"3. DO NOT swarm.notify back (loop risk). Go straight to swarm.ack.\n"
             f"4. swarm.ack(task_id=\"{task_id}\")."
+        )
+
+    if from_agent in NO_INBOX_AGENTS:
+        step3 = (
+            f"3. DO NOT swarm.notify {from_agent}: it has no inbound bus, the message "
+            f"would never be delivered. The owner chat report is the only reply; "
+            f"the owner forwards it to {from_agent} if needed.\n"
+        )
+    else:
+        step3 = (
+            f"3. ALSO SEND A SHORT SUMMARY TO WHOEVER SET THIS TASK via swarm.notify:\n"
+            f"   swarm.notify(to_agent=\"{from_agent}\", payload={{"
+            f"\"title\": \"Report from {to_agent}: <task name>\", "
+            f"\"body\": \"<2-4 bullets: what done + commit/path + gaps>\", "
+            f"\"_origin_task\": \"{task_id}\"}})\n"
+            f"   Without this step {from_agent} cannot see your work or schedule "
+            f"follow-ups. Chat report = owner, swarm.notify = {from_agent}. "
+            f"Two recipients. Do NOT notify anyone else about completing this task.\n"
         )
 
     return (
@@ -237,13 +272,7 @@ def _format_virtual_prompt(from_agent: str, to_agent: str, task_id: str, payload
         f"\n"
         f"   Avoid one-liner 'done, acked' reports. The owner wants substance, "
         f"at least 5-10 lines.\n"
-        f"3. ALSO SEND A SHORT SUMMARY TO THE COORDINATOR via swarm.notify:\n"
-        f"   swarm.notify(to_agent=\"{COORDINATOR_AGENT}\", payload={{"
-        f"\"title\": \"Report from {to_agent}: <task name>\", "
-        f"\"body\": \"<2-4 bullets: what done + commit/path + gaps>\", "
-        f"\"_origin_task\": \"{task_id}\"}})\n"
-        f"   Without this step the coordinator cannot see your work or schedule "
-        f"follow-ups. Chat report = owner, swarm.notify = coordinator. Two recipients.\n"
+        f"{step3}"
         f"4. Call swarm.ack(task_id=\"{task_id}\") at the very end."
     )
 
@@ -299,7 +328,6 @@ async def _deliver_one(
     payload = json.loads(row["payload_json"])
     # Repackage into gateway webhook schema.
     body = {
-        "agentId": to_agent,
         "message": _format_virtual_prompt(row["from_agent"], to_agent, row["task_id"], payload),
         "chatId": OWNER_CHAT_ID,
     }
@@ -325,7 +353,9 @@ async def _deliver_one(
         return "retry", f"http_error: {type(exc).__name__}: {exc}"
 
     if 200 <= resp.status_code < 300:
-        return "acked", ""
+        # 2xx from the gateway means "accepted for delivery", NOT "the agent handled it".
+        # Only the agent's own ack() may set 'acked' (task 145).
+        return "sent", ""
     if resp.status_code == 429:
         return "retry", f"http_429"
     if 400 <= resp.status_code < 500:
@@ -340,11 +370,12 @@ async def run() -> None:
     gateways = _load_gateways()
     auth_map = _load_gateway_auth()
     logger.info(
-        "swarm-worker started: gateways=%s auth_modes=%s recovered=%d poll=%ds",
+        "swarm-worker started: gateways=%s auth_modes=%s awaiting_ack=%d poll=%ds ack_timeout=%dmin",
         list(gateways.keys()),
         {a: v.mode for a, v in auth_map.items()},
         n_recovered,
         POLL_INTERVAL_SEC,
+        outbox.ACK_TIMEOUT_MINUTES,
     )
 
     async with httpx.AsyncClient() as client:
@@ -368,8 +399,8 @@ async def run() -> None:
                             logger.info("processing batch=%d", len(rows))
                         for row in rows:
                             status, last_error = await _deliver_one(client, gateways, row, auth_map)
-                            if status == "acked":
-                                await outbox.mark_acked(conn, row["task_id"])
+                            if status == "sent":
+                                await outbox.mark_sent(conn, row["task_id"])
                             elif status == "failed":
                                 await conn.execute(
                                     """
@@ -386,6 +417,8 @@ async def run() -> None:
                                     conn, row["id"], row["attempts"] + 1,
                                     row["max_attempts"], last_error,
                                 )
+                # Deliveries that got no ack in time become visible as ack_missing.
+                await outbox.sweep_ack_missing(pool)
             except Exception:
                 logger.exception("worker loop error")
 

@@ -175,10 +175,12 @@ async def run_worker() -> None:
                                 )
 
             if not rows and not _shutdown.requested:
+                embedder.release_if_idle()
                 await asyncio.sleep(POLL_SLEEP_SEC)
 
     finally:
         logger.info("Ingest worker shutting down")
+        embedder.close()
         await close_pool()
 
 

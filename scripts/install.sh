@@ -172,9 +172,17 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude '*.pyc' \
     --exclude '.env' \
     --exclude 'secrets/' \
+    --exclude 'vault/' \
     "$REPO_ROOT/" "$INSTALL_DIR/"
 else
   cp -a "$REPO_ROOT/." "$INSTALL_DIR/"
+fi
+
+# vault/ is created empty in step 4 and excluded from the rsync above (it must
+# survive re-installs); seed it from vault-template/ only on first install.
+if [ -z "$(ls -A "$INSTALL_DIR/vault" 2>/dev/null)" ]; then
+  log "seeding empty vault from vault-template/"
+  cp -a "$REPO_ROOT/vault-template/." "$INSTALL_DIR/vault/"
 fi
 
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR" "$LOG_DIR" "$STATE_DIR"

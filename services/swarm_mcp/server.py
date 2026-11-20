@@ -57,7 +57,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, object]]:
     pool = await get_pool(config)
     n_recovered = await outbox.bootstrap_recovery(pool)
     logger.info(
-        "swarm-mcp started: port=%d recovered=%d", config.mcp_port, n_recovered
+        "swarm-mcp started: port=%d awaiting_ack=%d", config.mcp_port, n_recovered
     )
     try:
         yield {"pool": pool, "config": config}
@@ -137,13 +137,20 @@ async def notify(
 
 @_gated_tool("ack")
 async def ack(task_id: str, ctx: Any = None) -> dict[str, Any]:
-    """Acknowledge a delivery — moves status to acked. Idempotent."""
+    """Acknowledge a delivery — you actually handled it. Moves status to acked.
+
+    Idempotent: acking the same task_id twice returns acked=true both times.
+    acked=false means only one thing — no delivery with that task_id exists.
+    """
     pool = await _get_pool()
     caller = await _resolve_caller(ctx, pool)
     async with pool.acquire() as conn:
         ok = await outbox.mark_acked(conn, task_id)
     await log_audit(pool, caller, "ack", {"task_id": task_id, "ok": ok}, "ok", 0)
-    return {"task_id": task_id, "acked": ok}
+    result: dict[str, Any] = {"task_id": task_id, "acked": ok}
+    if not ok:
+        result["reason"] = "unknown task_id"
+    return result
 
 
 @_gated_tool("broadcast")
@@ -216,10 +223,11 @@ async def list_recent_deliveries(
 
 @_gated_tool("list_my_pending", annotations={"readOnlyHint": True})
 async def list_my_pending(limit: int = 20, ctx: Any = None) -> list[dict[str, Any]]:
-    """Pull-based delivery: return pending deliveries addressed to the calling agent.
+    """Pull-based delivery: return the open inbox addressed to the calling agent.
 
-    Use on session start to fetch your inbox of inter-agent triggers.
-    Call ack(task_id) after handling each item.
+    Includes deliveries already pushed to you but not yet acked (status 'sent' or
+    'ack_missing') — that is how a session that restarted mid-task finds its work again.
+    Use on session start, then call ack(task_id) after handling each item.
     """
     pool = await _get_pool()
     me = await _resolve_caller(ctx, pool)

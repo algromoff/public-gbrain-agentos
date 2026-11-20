@@ -1,10 +1,21 @@
 """delivery_outbox state machine + DB operations.
 
 States: pending → sent → ack_missing → acked | failed
-MVP simplification: pending → (HTTP 200) acked | (HTTP fail) pending+retry | (max attempts) failed.
-sent/ack_missing reserved for Stage 2 ACK protocol.
+
+pending      — enqueued, not delivered yet.
+sent         — HTTP 2xx from the agent gateway: accepted FOR DELIVERY, not processed.
+acked        — the receiving agent called ack() after actually handling the payload.
+ack_missing  — delivered, but no ack within ACK_TIMEOUT_MINUTES (worker sweep). This is
+               the "delivered into the void" signal: session died, context overflowed,
+               or the agent ignored it.
+failed       — permanent delivery failure (4xx, or retries exhausted).
+
+Until 2026-08-19 the worker collapsed sent+acked into one status on HTTP 2xx. Consequence:
+an honest ack() from the agent found no updatable row and returned false, ack_missing never
+occurred, and stats reported delivery as processing. Un-collapsed in task 145.
 """
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -14,6 +25,18 @@ logger = logging.getLogger(__name__)
 
 BACKOFF_BASE_SEC = 10
 BACKOFF_CAP_SEC = 300
+
+# A row sitting in 'sent' longer than this is swept to 'ack_missing'.
+ACK_TIMEOUT_MINUTES = int(os.environ.get("SWARM_ACK_TIMEOUT_MIN", "30"))
+
+# Statuses an agent still owns: delivered or queued, but not yet handled.
+OPEN_STATUSES = ("pending", "sent", "ack_missing")
+ALL_STATUSES = ("pending", "sent", "ack_missing", "acked", "failed")
+
+
+def _rowcount(result: str) -> int:
+    """asyncpg execute() returns a command tag like 'UPDATE 1'."""
+    return int(result.split()[-1]) if result.startswith("UPDATE ") else 0
 
 
 def compute_backoff_seconds(attempts: int) -> int:
@@ -87,20 +110,83 @@ async def fetch_due(
     )
 
 
-async def mark_acked(conn: asyncpg.Connection, task_id: str) -> bool:
-    """Mark row as acked. Returns True if a row was updated."""
+async def mark_sent(conn: asyncpg.Connection, task_id: str) -> bool:
+    """Mark row as handed to the gateway (HTTP 2xx), now awaiting the agent's ack.
+
+    Only 'pending' rows move. A row the agent already acked must not be dragged back:
+    the agent can ack while the worker transaction is still open.
+    """
     result = await conn.execute(
         """
         UPDATE delivery_outbox
-        SET status = 'acked', updated_at = now()
-        WHERE task_id = $1 AND status IN ('pending', 'sent', 'ack_missing')
+        SET status = 'sent', updated_at = now()
+        WHERE task_id = $1 AND status = 'pending'
         """,
         task_id,
     )
-    rowcount = int(result.split()[-1]) if result.startswith("UPDATE ") else 0
+    rowcount = _rowcount(result)
     if rowcount > 0:
-        logger.info("outbox.mark_acked task_id=%s", task_id)
+        logger.info("outbox.mark_sent task_id=%s", task_id)
     return rowcount > 0
+
+
+async def mark_acked(conn: asyncpg.Connection, task_id: str) -> bool:
+    """Agent-side ack: the payload was actually handled.
+
+    True  — the row exists and is now acked, INCLUDING a repeat ack on an already
+            acked row (idempotent).
+    False — no such task_id.
+
+    The discriminator is row existence, not rowcount, so the caller can tell
+    "already done" from "wrong task_id" — the two used to be indistinguishable.
+    """
+    async with conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT status FROM delivery_outbox WHERE task_id = $1 FOR UPDATE",
+            task_id,
+        )
+        if row is None:
+            logger.info("outbox.mark_acked task_id=%s unknown_task_id", task_id)
+            return False
+        prev = row["status"]
+        if prev == "acked":
+            logger.info("outbox.mark_acked task_id=%s already_acked (idempotent)", task_id)
+            return True
+        if prev == "failed":
+            # The agent demonstrably holds the payload; trust the agent over the transport.
+            logger.warning("outbox.mark_acked task_id=%s acked a failed delivery", task_id)
+        await conn.execute(
+            "UPDATE delivery_outbox SET status = 'acked', updated_at = now() WHERE task_id = $1",
+            task_id,
+        )
+        logger.info("outbox.mark_acked task_id=%s from=%s", task_id, prev)
+        return True
+
+
+async def sweep_ack_missing(
+    pool: asyncpg.Pool,
+    timeout_minutes: int = ACK_TIMEOUT_MINUTES,
+) -> int:
+    """Move 'sent' rows older than the timeout to 'ack_missing'. Returns the count.
+
+    updated_at is the delivery timestamp (mark_sent sets it) and the sweep bumps it
+    again, so each row is swept exactly once.
+    """
+    result = await pool.execute(
+        """
+        UPDATE delivery_outbox
+        SET status = 'ack_missing', updated_at = now()
+        WHERE status = 'sent'
+          AND updated_at < now() - ($1 || ' minutes')::interval
+        """,
+        str(timeout_minutes),
+    )
+    n = _rowcount(result)
+    if n > 0:
+        logger.warning(
+            "outbox.ack_missing %d deliveries got no ack within %d min", n, timeout_minutes
+        )
+    return n
 
 
 async def mark_retry(
@@ -147,31 +233,40 @@ async def mark_retry(
 
 
 async def bootstrap_recovery(pool: asyncpg.Pool) -> int:
-    """Reset rows stuck in 'sent' or 'ack_missing' back to 'pending' on startup.
+    """Report deliveries waiting for an agent ack on startup. Mutates nothing.
 
-    Why: if worker died mid-flight, those rows would never be retried.
+    Until task 145 this reset 'sent'/'ack_missing' back to 'pending'. Harmless while
+    those statuses never occurred — destructive now that the worker really marks 'sent':
+    every restart would re-POST already delivered payloads and the receiving agent would
+    see each task twice. A worker that dies mid-flight leaves its row 'pending' (mark_sent
+    had not committed yet), so the ordinary retry path still covers the crash case.
     """
-    result = await pool.execute(
+    row = await pool.fetchrow(
         """
-        UPDATE delivery_outbox
-        SET status = 'pending',
-            next_retry_at = now(),
-            updated_at = now()
+        SELECT count(*)::int AS c FROM delivery_outbox
         WHERE status IN ('sent', 'ack_missing')
         """
     )
-    n = int(result.split()[-1]) if result.startswith("UPDATE ") else 0
+    n = int(row["c"]) if row else 0
     if n > 0:
-        logger.warning("outbox.bootstrap reset %d non-terminal rows to pending", n)
+        logger.info("outbox.bootstrap %d deliveries awaiting agent ack (left untouched)", n)
     return n
 
 
 async def get_stats(pool: asyncpg.Pool) -> dict[str, int]:
-    """Return counts per status for observability."""
+    """Return counts per status for observability.
+
+    Every known status is present even at zero, so a monitor can see that
+    'sent'/'ack_missing' exist as concepts instead of reading a missing key as
+    "no such problem". 'acked' now means processed by the agent, not delivered.
+    """
     rows = await pool.fetch(
         "SELECT status, count(*)::int AS c FROM delivery_outbox GROUP BY status"
     )
-    return {row["status"]: row["c"] for row in rows}
+    stats = {status: 0 for status in ALL_STATUSES}
+    for row in rows:
+        stats[row["status"]] = row["c"]
+    return stats
 
 
 async def list_recent(
@@ -225,29 +320,33 @@ async def list_recent(
 
 
 async def list_pending_for(pool: asyncpg.Pool, to_agent: str, limit: int = 20) -> list[dict[str, Any]]:
-    """Return pending deliveries addressed to a specific agent (pull-based delivery).
+    """Return the agent's open inbox: everything addressed to it and not yet acked.
 
-    Agent calls this on session start to fetch its inbox.
-    Status remains 'pending' until agent acks via mark_acked.
+    Covers 'pending' (not delivered yet), 'sent' (delivered, awaiting this agent's ack)
+    and 'ack_missing' (delivered, ack overdue). 'sent' is the important one: an agent
+    that restarted between delivery and ack would otherwise find an empty inbox and the
+    task would be lost silently.
     """
     import json as _json
     rows = await pool.fetch(
         """
-        SELECT task_id, from_agent, payload::text AS payload_json,
-               created_at, attempts
+        SELECT task_id, from_agent, status, payload::text AS payload_json,
+               created_at, updated_at, attempts
         FROM delivery_outbox
-        WHERE to_agent = $1 AND status = 'pending'
+        WHERE to_agent = $1 AND status = ANY($2::text[])
         ORDER BY created_at
-        LIMIT $2
+        LIMIT $3
         """,
-        to_agent, limit,
+        to_agent, list(OPEN_STATUSES), limit,
     )
     return [
         {
             "task_id": r["task_id"],
             "from_agent": r["from_agent"],
+            "status": r["status"],
             "payload": _json.loads(r["payload_json"]),
             "created_at": r["created_at"].isoformat(),
+            "updated_at": r["updated_at"].isoformat(),
             "attempts": r["attempts"],
         }
         for r in rows
