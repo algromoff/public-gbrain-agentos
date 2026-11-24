@@ -264,3 +264,61 @@ def test_auth_capture_middleware_uses_shared_helper() -> None:
     from services.swarm_mcp.server import AuthCaptureMiddleware
 
     assert issubclass(AuthCaptureMiddleware, HermesAwareAuthMiddleware)
+
+
+# --- No-inbox rejection (24.11.2026) ------------------------------------------
+
+
+def test_no_inbox_reason_rejects_agent_without_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """notify to an agent missing from AGENT_GATEWAYS must be refused up front."""
+    import services.swarm_mcp.server as server_mod
+
+    monkeypatch.setenv("AGENT_GATEWAYS", '{"coder": "http://127.0.0.1:1/x"}')
+    reason = server_mod._no_inbox_reason("richard")
+    assert reason is not None and "richard" in reason and "владельцу" in reason
+    assert server_mod._no_inbox_reason("coder") is None
+
+
+def test_no_inbox_reason_disabled_without_gateway_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty/absent gateway map (dev, tests) must not block anything."""
+    import services.swarm_mcp.server as server_mod
+
+    monkeypatch.delenv("AGENT_GATEWAYS", raising=False)
+    assert server_mod._no_inbox_reason("richard") is None
+    monkeypatch.setenv("AGENT_GATEWAYS", "{not json}")
+    assert server_mod._no_inbox_reason("richard") is None
+
+
+def test_notify_raises_before_enqueue_for_no_inbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refused notify must not reach the outbox (no silent 5-retry failure)."""
+    import services.swarm_mcp.server as server_mod
+
+    monkeypatch.setenv("AGENT_GATEWAYS", '{"coder": "http://127.0.0.1:1/x"}')
+    enqueued: list[str] = []
+    audits: list[str] = []
+
+    async def fake_pool():
+        return object()
+
+    async def fake_caller(ctx, pool):
+        return "marketer"
+
+    async def fake_enqueue(pool, frm, to, payload, tid, attempts):
+        enqueued.append(to)
+        return "tid-1"
+
+    async def fake_audit(pool, agent, tool, args, status, ms):
+        audits.append(status)
+
+    monkeypatch.setattr(server_mod, "_get_pool", fake_pool)
+    monkeypatch.setattr(server_mod, "_resolve_caller", fake_caller)
+    monkeypatch.setattr(server_mod.outbox, "enqueue", fake_enqueue)
+    monkeypatch.setattr(server_mod, "log_audit", fake_audit)
+
+    fn = getattr(server_mod.notify, "fn", server_mod.notify)
+    with pytest.raises(ValueError, match="нет входящих"):
+        asyncio.run(fn("richard", {"title": "t", "body": "b"}))
+    assert enqueued == [] and audits == ["rejected"]
+
+    assert asyncio.run(fn("coder", {"title": "t", "body": "b"})) == {"task_id": "tid-1", "status": "pending"}
+    assert enqueued == ["coder"]

@@ -24,6 +24,25 @@ from services.shared.audit import log_audit
 from services.shared.tool_gating import parse_tool_set, should_register_tool
 
 from . import outbox
+from .worker import _load_gateways
+
+
+def _no_inbox_reason(to_agent: str) -> str | None:
+    """Why ``to_agent`` cannot receive deliveries, or None if it can.
+
+    The worker can only deliver to agents listed in AGENT_GATEWAYS. Before this
+    check a notify to such an agent (richard, by design without an inbox) was
+    accepted, retried five times and failed silently ~3 minutes later - the
+    sender never learned the task did not arrive (24.11.2026). An empty map
+    (dev/tests without gateways) disables the check.
+    """
+    gateways = _load_gateways()
+    if not gateways or to_agent in gateways:
+        return None
+    return (
+        f"У агента {to_agent} нет входящих в шине: доставить нельзя. "
+        f"Задачу или данные для {to_agent} передай владельцу текстом в его чат."
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,6 +149,10 @@ async def notify(
     """
     pool = await _get_pool()
     from_agent = await _resolve_caller(ctx, pool)
+    reason = _no_inbox_reason(to_agent)
+    if reason:
+        await log_audit(pool, from_agent, "notify", {"to": to_agent, "task_id": task_id}, "rejected", 0)
+        raise ValueError(reason)
     tid = await outbox.enqueue(pool, from_agent, to_agent, payload, task_id, max_attempts)
     await log_audit(pool, from_agent, "notify", {"to": to_agent, "task_id": tid}, "ok", 0)
     return {"task_id": tid, "status": "pending"}
@@ -164,11 +187,19 @@ async def broadcast(
     pool = await _get_pool()
     from_agent = await _resolve_caller(ctx, pool)
     task_ids: dict[str, str] = {}
+    rejected: dict[str, str] = {}
     for to in agents:
+        reason = _no_inbox_reason(to)
+        if reason:
+            rejected[to] = reason
+            continue
         tid = await outbox.enqueue(pool, from_agent, to, payload, None, max_attempts)
         task_ids[to] = tid
-    await log_audit(pool, from_agent, "broadcast", {"agents": agents, "n": len(agents)}, "ok", 0)
-    return {"task_ids": task_ids}
+    await log_audit(pool, from_agent, "broadcast", {"agents": agents, "n": len(task_ids), "rejected": sorted(rejected)}, "ok", 0)
+    result: dict[str, Any] = {"task_ids": task_ids}
+    if rejected:
+        result["rejected"] = rejected
+    return result
 
 
 @_gated_tool("escalate")
@@ -184,6 +215,10 @@ async def escalate(
     enriched["_escalation_reason"] = reason
     pool = await _get_pool()
     from_agent = await _resolve_caller(ctx, pool)
+    no_inbox = _no_inbox_reason(to_agent)
+    if no_inbox:
+        await log_audit(pool, from_agent, "escalate", {"to": to_agent, "reason": reason}, "rejected", 0)
+        raise ValueError(no_inbox)
     tid = await outbox.enqueue(pool, from_agent, to_agent, enriched, None, max_attempts=10)
     await log_audit(pool, from_agent, "escalate", {"to": to_agent, "reason": reason, "task_id": tid}, "ok", 0)
     return {"task_id": tid, "status": "pending", "priority": "high"}
